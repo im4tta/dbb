@@ -1,0 +1,45 @@
+name: pg_dump backup
+on:
+  schedule: [{ cron: "0 20 * * *" }]   # 03:00 Phnom Penh; runs auto=on targets
+  workflow_dispatch:
+    inputs:
+      target: { description: "Target name or all", default: "all" }
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+      GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      API: ${{ secrets.GITLAB_URL }}/api/v4/projects/${{ secrets.GITLAB_PROJECT_ID }}
+      KEEP: "7"
+    steps:
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-common >/dev/null
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null
+          sudo apt-get install -y -qq postgresql-client-17 >/dev/null
+      - name: Dump, upload, report
+        run: |
+          set -u
+          T="${{ github.event.inputs.target || 'all' }}"
+          AUTO=$([ "${{ github.event_name }}" = "schedule" ] && echo 1 || echo 0)
+          curl -fsS -H "Authorization: Bearer $RUNNER_TOKEN" "$APP_URL/api/runner?target=$T&auto=$AUTO" > targets.json
+          jq -c '.[]' targets.json | while read -r row; do
+            id=$(jq -r .id <<<"$row"); name=$(jq -r .name <<<"$row"); conn=$(jq -r .conn <<<"$row")
+            echo "::add-mask::$conn"
+            safe=$(printf %s "$name" | tr -c 'A-Za-z0-9._-' '_')
+            ts=$(date +%Y%m%d-%H%M%S); f="$safe-$ts.dump"; size=0; note=""
+            if /usr/lib/postgresql/17/bin/pg_dump "$conn" -Fc --no-owner -f "$f" 2>err.log; then
+              size=$(stat -c%s "$f")
+              if curl -fsS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" --upload-file "$f" "$API/packages/generic/$safe/$ts/$f" >/dev/null; then
+                status=ok
+                curl -fsS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/packages?package_type=generic&package_name=$safe&order_by=created_at&sort=desc&per_page=100" \
+                  | jq -r --argjson k "$KEEP" '.[$k:][]?.id' \
+                  | while read -r p; do curl -fsS -X DELETE -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/packages/$p" >/dev/null; done
+              else status=failed; note="GitLab upload failed"; fi
+            else status=failed; note=$(tail -c 300 err.log | sed "s|$conn|***|g"); fi
+            jq -n --argjson id "$id" --arg s "$status" --argjson b "$size" --arg n "$note" '{id:$id,status:$s,bytes:$b,note:$n}' \
+              | curl -fsS -X POST -H "Authorization: Bearer $RUNNER_TOKEN" -H "content-type: application/json" -d @- "$APP_URL/api/runner" >/dev/null
+            rm -f "$f"
+          done
